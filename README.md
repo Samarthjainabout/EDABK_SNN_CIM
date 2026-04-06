@@ -76,65 +76,71 @@ The design follows a modular structure and is fully synthesizable on the Caravel
 | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `nvm_core_decoder.v`       | Decodes address ranges (`wbs_adr_i[15:12]`) and routes Wishbone signals to either Synapse Matrix, Spike Memory, or Picture-Done handler.                        |
 | `nvm_synapse_matrix.v`     | Instantiates 16 Neuromorphic_X1 ReRAM macros. Broadcasts commands (PROGRAM/READ) to all macros and concatenates their 1-bit outputs into a 16-bit synapse vector. |
-| `nvm_neuron_block.v`       | Digital neuron array, each neuron integrates signed input (stimulus) if synapse=1. Fires (spike=1) if potential ≥ 0. Resets on `picture_done`.                 |
+| `nvm_neuron_block.v`       | Digital LIF neuron array. Performs spatial accumulation during `enable`, then evaluates threshold, spike generation, membrane reset, and leak on `picture_done`. |
 | `nvm_neuron_spike_out.v`   | Stores 64 output spikes into 4×16-bit registers. Accessible via Wishbone at address `0x3000_1000`.                                                             |
 | `nvm_neuron_core_256x64.v` | Top-level module combining all blocks, interfaces to Wishbone bus, controls data flow between software, ReRAM synapses, neurons, and spike output memory.         |
 
-## RTL Operation Description
+## System Architecture and Recent Upgrades
 
-The RTL operates in four main stages:
+The application of hand gesture recognition can be extended to advanced human-machine interaction, enabling touchless control in various domains. However, deploying AI models on edge devices is often hindered by the von Neumann bottleneck.
 
-### **1. Command from Firmware**
+This architecture addresses that challenge by integrating **In-Memory Computing (IMC)** using non-volatile ReRAM macros to store synaptic weights directly at the compute nodes.
 
-- Firmware writes a 32-bit word via Wishbone.
-- The address determines whether the command is:
-  - Synapse READ / PROGRAM
-  - Spike output read
-  - Picture-done/reset
-- `nvm_core_decoder.v` activates the correct internal block.
+### Recent Architectural Upgrades
 
-### **2. In-Memory Synapse Access (IMC Stage)**
+1. **True Leaky Integrate-and-Fire (LIF) Dynamics:**
+   The digital neuron block (`nvm_neuron_block.v`) has been upgraded from a static accumulator to a full LIF model. It separates **spatial accumulation** (Wishbone data streaming) from **temporal evaluation** (leaking and firing at the frame boundary) to correctly process asynchronous temporal data.
 
-- `nvm_synapse_matrix.v` forwards the command to the ReRAM synapse IP.
-- For READ:
-  - The ReRAM array performs **in-memory synaptic multiplication**.
-  - Each ReRAM column returns a **1-bit output**, forming `connection[15:0]`.
-- For PROGRAM:
-  - The selected synapse weight (conductance state) is updated.
+2. **DVS128 Gesture Integration:**
+   The end-to-end verification pipeline now supports asynchronous event-camera traffic (IBM DVS128 Dataset) via dynamic Python parsers (`dvs_parser.py`) in the testbench.
 
-### **3. Neuron Accumulation and Spike Generation**
+3. **ReRAM Conductance Degradation Modeling:**
+   The digital verification flow integrates Python-based analog ReRAM physics models to emulate hardware aging and LRS/HRS drift over time.
 
-- `nvm_neuron_block.v` takes:
-  - The 16-bit `connection` vector from the synapse matrix.
-  - A signed input `stimulus` from the Wishbone data.
-- Each neuron integrates the value if connection is active:
-  ```verilog
-  if (enable && connection[i])
-      potential[i] <= potential[i] + stimulus;
-  spike_o[i] = (potential[i] >= 0);
+## RTL Operation (LIF Dynamics)
 
-  ```
-- If the membrane potential reaches or exceeds zero → a spike (1) is generated.
-- If picture_done is asserted, all neuron potentials are cleared for the next frame.
+The RTL runs in a continuous spatial-temporal loop over the Wishbone bus:
 
-### **Step 4: Spike Output and Readback**
+### 1. In-Memory Synapse Access
 
-Once all input features for a gesture frame have been processed, the neuron block produces a 64-bit spike vector (`spike_o`). This value is transferred into the `nvm_neuron_spike_out.v` module, where it is stored in four 16-bit registers.
+- `nvm_synapse_matrix.v` performs in-memory synaptic multiplication.
+- Each ReRAM column returns a 1-bit output, forming `connection[15:0]`.
+
+### 2. Spatial Accumulation
+
+- During the `enable` strobe, the neuron block accumulates signed stimuli across the 256 axons serially.
+
+### 3. Temporal Tick and Fire
+
+- When `picture_done` is asserted (end of one temporal frame), each neuron evaluates its membrane potential, fires if threshold is reached, and otherwise applies leak.
+
+```verilog
+// TEMPORAL TICK: Evaluate, Fire, and Leak
+if (picture_done) begin
+    if (potential[i] >= THRESHOLD) begin
+        spike_o[i]   <= 1'b1;   // Fire spike
+        potential[i] <= 16'b0;  // Reset membrane
+    end else begin
+        spike_o[i]   <= 1'b0;
+        // Apply temporal leak
+        if (potential[i] > LEAK)
+            potential[i] <= potential[i] - LEAK;
+        else
+            potential[i] <= 16'b0;
+    end
+end
+```
+
+### 4. Spike Output and Readback
+
+After each frame, the spike vector is stored in `nvm_neuron_spike_out.v` and read through Wishbone:
 
 | Wishbone Address | Data Returned             |
 | ---------------- | ------------------------- |
-| `0x3000_1000`  | Spikes for neurons 0–15  |
-| `0x3000_1002`  | Spikes for neurons 16–31 |
-| `0x3000_1004`  | Spikes for neurons 32–47 |
-| `0x3000_1006`  | Spikes for neurons 48–63 |
-
-To finalize one classification event, the firmware writes to the **picture-done address** `0x3000_2000`. This triggers three actions in hardware:
-
-1. **Spike latch** → Current 64-bit spike results are saved.
-2. **Neuron reset** → All membrane potentials (`potential[i]`) are cleared.
-3. **Ready for next frame** → The system waits for new synaptic inputs.
-
-After this point, the firmware can read spikes via Wishbone and interpret them as the output class of the gesture.
+| `0x3000_1000`    | Spikes for neurons 0-15   |
+| `0x3000_1002`    | Spikes for neurons 16-31  |
+| `0x3000_1004`    | Spikes for neurons 32-47  |
+| `0x3000_1006`    | Spikes for neurons 48-63  |
 
 ## ReRAM SNN 1T1R Additions
 
@@ -202,6 +208,41 @@ make
 ```
 
 This launches the cocotb-based verification flow for the newly added ReRAM 1T1R SNN RTL files.
+
+## Running the Cocotb Verification Environment
+
+To test system-level SNN routing and LIF physics, a complete cocotb simulation environment is provided.
+
+For Ubuntu/Linux users, running in an isolated Python virtual environment is recommended to avoid `cocotb-config` path issues.
+
+### Step 1: Clone the repository
+
+```bash
+git clone https://github.com/<your-username>/EDABK_SNN_CIM.git
+cd EDABK_SNN_CIM
+```
+
+### Step 2: Set up a virtual environment
+
+```bash
+cd verilog/tb
+python3 -m venv venv
+source venv/bin/activate
+```
+
+### Step 3: Install dependencies
+
+```bash
+pip install cocotb aedat numpy
+```
+
+### Step 4: Run the simulation
+
+```bash
+make
+```
+
+The simulation dynamically generates Wishbone transactions, streams stimuli through the ReRAM matrix, evaluates LIF neuron potentials, and outputs final gesture classification spikes.
 
 ### Integration note
 
