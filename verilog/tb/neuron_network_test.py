@@ -10,7 +10,7 @@ from cocotb.clock import Clock
 from cocotb.handle import SimHandleBase
 from cocotb.queue import Queue
 # from cocotb.runner import get_runner
-from cocotb.triggers import RisingEdge, FallingEdge, ClockCycles, Join
+from cocotb.triggers import RisingEdge, FallingEdge, ClockCycles
 from nvm_parameter import *
 from read_file import *
 
@@ -38,8 +38,107 @@ async def load_and_inject_stimuli(dut, file_path):
         if i % 32 == 0:
             dut._log.info(f"Processing Frame {i//32}...")
 
-BASE_DIR = "./mem/connection"
-INPUT_FILE = "stimuli_class2.txt"
+TB_DIR = Path(__file__).resolve().parent
+BASE_DIR = TB_DIR / "mem" / "connection"
+
+_default_input = TB_DIR / "stimuli_class2.txt"
+_fallback_input = TB_DIR / "mem" / "stimuli" / "stimuli.txt"
+INPUT_FILE = Path(os.environ.get("TB_STIMULI_FILE", str(_default_input)))
+if not INPUT_FILE.exists() and _fallback_input.exists():
+    INPUT_FILE = _fallback_input
+
+LAYER1_SPIKE_STIM = int(os.environ.get("TB_LAYER1_SPIKE_STIM", "1"))
+LAYER2_SPIKE_STIM = int(os.environ.get("TB_LAYER2_SPIKE_STIM", "4"))
+DEBUG_ACTIVE_AXON = os.environ.get("TB_DEBUG_ACTIVE_AXON", "0") == "1"
+L0_STIM_MODE = os.environ.get("TB_L0_STIM_MODE", "raw16").strip().lower()
+L0_STIM_GAIN = int(os.environ.get("TB_L0_STIM_GAIN", "1"))
+INTER_PIC_IDLE_CYCLES = int(os.environ.get("TB_INTER_PIC_IDLE_CYCLES", "0"))
+RESET_BETWEEN_PICS = os.environ.get("TB_RESET_BETWEEN_PICS", "0") == "1"
+HARD_RESET_BETWEEN_PICS = os.environ.get("TB_HARD_RESET_BETWEEN_PICS", "0") == "1"
+
+RRAM_AGE_S = float(os.environ.get("TB_RRAM_AGE_S", "1500.0"))
+RRAM_LRS_KEEP_THRESHOLD = float(os.environ.get("TB_RRAM_LRS_KEEP_THRESHOLD", "1.5"))
+DISABLE_RRAM_DEGRADATION = os.environ.get("TB_DISABLE_RRAM_DEGRADATION", "0") == "1"
+
+
+def load_stimuli_frames(file_path, requested_pics=None):
+    """Load 32-bit row stimuli grouped as 32 rows per frame."""
+    with open(file_path, "r") as f:
+        lines = [line.strip() for line in f if line.strip() and not line.startswith("//")]
+
+    if len(lines) < 32:
+        raise ValueError(f"Stimuli file has only {len(lines)} valid rows: {file_path}")
+
+    available_pics = len(lines) // 32
+    if requested_pics is None:
+        pics_to_use = available_pics
+    else:
+        pics_to_use = min(requested_pics, available_pics)
+
+    stimuli = []
+    for pic in range(pics_to_use):
+        frame_data = []
+        for row in range(32):
+            row_int = int(lines[pic * 32 + row], 2)
+            frame_data.append(row_int)
+        stimuli.append(frame_data)
+
+    return stimuli
+
+
+def encode_l0_block(block_16b):
+    """Encode a 16-bit input block into the scalar stimulus consumed by the neuron core."""
+    mode = L0_STIM_MODE
+    if mode == "raw16":
+        return block_16b
+
+    bit_count = bin(block_16b & 0xFFFF).count("1")
+    if mode == "popcount16":
+        return bit_count * max(1, L0_STIM_GAIN)
+    if mode == "binary_presence":
+        return max(1, L0_STIM_GAIN) if bit_count > 0 else 0
+
+    raise ValueError(f"Unsupported TB_L0_STIM_MODE={L0_STIM_MODE}. Use raw16|popcount16|binary_presence")
+
+
+def summarize_stimuli_activity(stimuli):
+    if not stimuli:
+        print("Stimuli summary: no frames")
+        return
+    frame_ones = []
+    for frame in stimuli:
+        ones = sum(bin(row).count("1") for row in frame)
+        frame_ones.append(ones)
+    print(
+        "Stimuli summary: "
+        f"frames={len(stimuli)}, "
+        f"frame_ones_min={min(frame_ones)}, "
+        f"frame_ones_max={max(frame_ones)}, "
+        f"frame_ones_avg={sum(frame_ones)/float(len(frame_ones)):.2f}"
+    )
+
+
+def summarize_layer_activity(layer_name, spike_matrix):
+    """Print compact spike statistics to detect silence/saturation quickly."""
+    if not spike_matrix:
+        print(f"{layer_name} activity: no frames")
+        return
+
+    frame_count = len(spike_matrix)
+    neuron_count = len(spike_matrix[0]) if spike_matrix[0] else 0
+    total_slots = frame_count * neuron_count
+    total_spikes = sum(sum(frame) for frame in spike_matrix)
+    spike_ratio = (total_spikes / float(total_slots)) if total_slots > 0 else 0.0
+    per_frame_counts = [sum(frame) for frame in spike_matrix]
+    unique_frame_count = len({tuple(frame) for frame in spike_matrix})
+    min_frame_spikes = min(per_frame_counts) if per_frame_counts else 0
+    max_frame_spikes = max(per_frame_counts) if per_frame_counts else 0
+
+    print(
+        f"{layer_name} activity summary: total_spikes={total_spikes}, "
+        f"spike_ratio={spike_ratio:.4f}, frame_min={min_frame_spikes}, "
+        f"frame_max={max_frame_spikes}, unique_frames={unique_frame_count}/{frame_count}"
+    )
 # --- Helper Functions for Wishbone and NVM Access ---
 
 # Wishbone Write: Used to send control or configuration data to the DUT.
@@ -104,7 +203,7 @@ async def wishbone_read(dut, address, spike_o_matrix=None, pic=0, slice_idx=0, l
     # Read the output data from the DUT
     # The output spike is expected to be reversed (LSB first) for easier indexing.
     # Assumes dut.wbs_dat_o.value returns a BinaryValue
-    output_spike = dut.wbs_dat_o.value.binstr[::-1] if hasattr(dut.wbs_dat_o.value, 'binstr') else str(dut.wbs_dat_o.value)[::-1] 
+    output_spike = str(dut.wbs_dat_o.value)[::-1]
     
     # If a spike matrix is provided, parse and store the spike outputs
     if spike_o_matrix is not None:
@@ -205,14 +304,13 @@ def get_connection_file_path(base_dir, index, part=None):
         filename = f"connection_{index:03}_part{part}.txt"
     else:
         filename = f"connection_{index:03}.txt"
-    # NOTE: Hardcoded base path should ideally be an environment variable or argument
-    return f"{base_dir}/{filename}"
+    return str(Path(base_dir) / filename)
 
 def load_connection_matrices(base_path):
     """Loads all connection matrices into a dictionary."""
     print("Loading connection files...")
     connection_matrices = {}
-    
+        
     # Layer 0 connections (0 to 12)
     for i in range(13):
         path = get_connection_file_path(base_path, i)
@@ -247,36 +345,64 @@ async def program_layer_connections(dut, core_idx, layer_conn, NUM_NEURON_LAYER)
             # Get the ideal, perfect bits from the text file
             val_slice = layer_conn[axon][NUM_NEURON_LAYER - (neuron + 16):NUM_NEURON_LAYER - neuron] 
             
-            # --- RRAM PHYSICS DEGRADATION ---
-            # We assume an age of 1500 seconds (inside the relaxation window)
-            # and that we programmed using 'ramp' modulation.
-            SIMULATED_AGE_S = 1500.0 
-            
             degraded_slice = []
             for bit in val_slice:
                 if bit == 1:
-                    # Calculate true LRS (Low Resistance State) conductance
-                    g_val = conductance_at_age(SIMULATED_AGE_S, state="LRS", modulation="ramp")
-                    # If conductance drops too low, the digital bit flips to 0
-                    degraded_bit = 1 if g_val > 1.5 else 0 
+                    if DISABLE_RRAM_DEGRADATION:
+                        degraded_bit = 1
+                    else:
+                        # Calculate true LRS (Low Resistance State) conductance.
+                        g_val = conductance_at_age(RRAM_AGE_S, state="LRS", modulation="ramp")
+                        # If conductance drops too low, the digital bit flips to 0.
+                        degraded_bit = 1 if g_val > RRAM_LRS_KEEP_THRESHOLD else 0
                 else:
-                    # Calculate true HRS (High Resistance State) conductance
-                    g_val = conductance_at_age(SIMULATED_AGE_S, state="HRS", modulation="ramp")
-                    degraded_bit = 0 # HRS stays 0 digitally
+                    degraded_bit = 0
                     
                 degraded_slice.append(degraded_bit)
 
             # Convert the physically-degraded bits to an integer for the Verilog chip
             int_val = list_to_binary(degraded_slice)
+
+            data_to_write = (
+                (MODE_PROGRAM << 30) |
+                (row          << 25) |
+                (col          << 20) |
+                (0            << 16) |
+                int_val
+            )
+
+            await nvm_write(dut, 0x30000000, data_to_write)
             
-async def run_layer_for_all_pics(dut, core_idx, layer, num_cores, spike_in_matrix, spike_out_matrix, stimuli=None, layer_axon_limit=None):
+async def run_layer_for_all_pics(dut, core_idx, layer, num_cores, spike_in_matrix, spike_out_matrix, num_pics, stimuli=None, layer_axon_limit=None):
     """
     Runs the simulation for all input pictures for a specific core (EVERY PIC step).
     
     This corresponds to the 'MODE_READ' operation (stimulus application).
     """
-    for pic in range(SUM_OF_PICS):
+    per_pic_active_axons = []
+    per_pic_input_signature = []
+
+    for pic in range(num_pics):
         print(f"Layer {layer} - Core {core_idx} - Pic {pic}")
+
+        # Optional frame separation to avoid carry-over dynamics from previous picture.
+        if pic > 0 and INTER_PIC_IDLE_CYCLES > 0:
+            await ClockCycles(dut.wb_clk_i, INTER_PIC_IDLE_CYCLES)
+        if pic > 0 and RESET_BETWEEN_PICS:
+            # Soft clear between pictures: preserve programmed weights, clear per-slice state.
+            await wishbone_write(dut, 0x30002000, 0)
+            await wishbone_write(dut, 0x30002002, 0)
+            await wishbone_write(dut, 0x30002004, 0)
+            await wishbone_write(dut, 0x30002006, 0)
+
+            # Optional hard reset is explicit because it can wipe programmed state.
+            if HARD_RESET_BETWEEN_PICS:
+                dut.wb_rst_i.value = 1
+                await ClockCycles(dut.wb_clk_i, 2)
+                dut.wb_rst_i.value = 0
+
+        active_axon_count = 0
+        input_signature = 0
         
         # Iterate over the NVM array structure
         for row_i in range(32):
@@ -307,15 +433,29 @@ async def run_layer_for_all_pics(dut, core_idx, layer, num_cores, spike_in_matri
                     
                     if (axon % 2) == 0:
                         # Even axon: Take the upper 16 bits [31:16]
-                        val_slice = (full_stimuli_val >> 16) & 0xFFFF
+                        block_16b = (full_stimuli_val >> 16) & 0xFFFF
                     else:
                         # Odd axon: Take the lower 16 bits [15:0]
-                        val_slice = full_stimuli_val & 0xFFFF
+                        block_16b = full_stimuli_val & 0xFFFF
+
+                    val_slice = encode_l0_block(block_16b)
                         
                     spike_active = True # We always trigger the read for L0 to inject the block
+                elif layer == 1 and spike_in_matrix is not None:
+                    input_idx = core_idx * NUM_AXON_LAYER_1 + axon
+                    if input_idx < len(spike_in_matrix[pic]) and spike_in_matrix[pic][input_idx] == 1:
+                        val_slice = max(0, min(0xFFFF, LAYER1_SPIKE_STIM))
+                        spike_active = True
+                elif layer == 2 and spike_in_matrix is not None:
+                    input_idx = axon
+                    if input_idx < len(spike_in_matrix[pic]) and spike_in_matrix[pic][input_idx] == 1:
+                        val_slice = max(0, min(0xFFFF, LAYER2_SPIKE_STIM))
+                        spike_active = True
                 
                 
                 if spike_active:
+                    active_axon_count += 1
+                    input_signature = ((input_signature * 1315423911) ^ (axon + 0x9E3779B9)) & 0xFFFFFFFF
                     # Construct the 32-bit data word for NVM Read Operation (stimulus application)
                     # {MODE_READ(2), row(5), col(5), padding(4), stimulus_data(16)}
                     data_for_read_op = (
@@ -344,6 +484,23 @@ async def run_layer_for_all_pics(dut, core_idx, layer, num_cores, spike_in_matri
         # Read the output spikes from the two slices of the core after processing all inputs
         await wishbone_read(dut, 0x30001000, spike_out_matrix, pic, slice_idx=0, layer=layer, core=core_idx)
         await wishbone_read(dut, 0x30001004, spike_out_matrix, pic, slice_idx=1, layer=layer, core=core_idx) 
+        per_pic_active_axons.append(active_axon_count)
+        per_pic_input_signature.append(input_signature)
+        if DEBUG_ACTIVE_AXON and layer in (1, 2):
+            print(
+                f"L{layer} Core {core_idx} Pic {pic} "
+                f"active_axons={active_axon_count} sig=0x{input_signature:08X}"
+            )
+
+    if layer in (1, 2) and per_pic_active_axons:
+        min_active = min(per_pic_active_axons)
+        max_active = max(per_pic_active_axons)
+        unique_sig = len(set(per_pic_input_signature))
+        print(
+            f"L{layer} Core {core_idx} input summary: "
+            f"active_axons[min,max]=[{min_active},{max_active}], "
+            f"unique_signatures={unique_sig}/{len(per_pic_input_signature)}"
+        )
 
 # --- Cocotb Test ---
 
@@ -356,29 +513,33 @@ async def neuron_network_test(dut):
     connection_matrices = load_connection_matrices(base_dir)
     
     # Load stimuli and correct output files
-    # Load stimuli properly into [pic][row] array of 32-bit integers
-    stimuli = []
-    with open(INPUT_FILE, "r") as f:
-        # Get all binary string lines, ignoring comments
-        lines = [line.strip() for line in f if line.strip() and not line.startswith("//")]
-        
-        # We have 10 frames (pics), each with 32 rows
-        for pic in range(10): 
-            frame_data = []
-            for row in range(32):
-                # Convert the 32-bit binary string directly to an integer
-                row_int = int(lines[pic * 32 + row], 2)
-                frame_data.append(row_int)
-            stimuli.append(frame_data)
+    # TB_NUM_PICS can override picture count for quick tests; default is full file.
+    tb_num_pics = os.environ.get("TB_NUM_PICS")
+    requested_pics = int(tb_num_pics) if tb_num_pics else None
+    stimuli = load_stimuli_frames(INPUT_FILE, requested_pics)
+    run_pics = len(stimuli)
+
+    print(
+        "TB config: "
+        f"INPUT_FILE={INPUT_FILE}, run_pics={run_pics}, "
+        f"L0_STIM_MODE={L0_STIM_MODE}, L0_STIM_GAIN={L0_STIM_GAIN}, "
+        f"INTER_PIC_IDLE_CYCLES={INTER_PIC_IDLE_CYCLES}, "
+        f"RESET_BETWEEN_PICS={RESET_BETWEEN_PICS}, HARD_RESET_BETWEEN_PICS={HARD_RESET_BETWEEN_PICS}, "
+        f"DISABLE_RRAM_DEGRADATION={DISABLE_RRAM_DEGRADATION}, "
+        f"RRAM_AGE_S={RRAM_AGE_S}, RRAM_LRS_KEEP_THRESHOLD={RRAM_LRS_KEEP_THRESHOLD}"
+    )
+    if run_pics <= 1:
+        print("WARNING: run_pics <= 1, prediction confidence will be limited. Prefer TB_NUM_PICS>=5.")
+    summarize_stimuli_activity(stimuli)
     
     # Initialize spike output matrices for each layer
-    spike_out_layer_0 = [[0 for _ in range(NUM_CORES_LAYER_0 * NUM_NEURON)] for __ in range(SUM_OF_PICS)]
-    spike_out_layer_1 = [[0 for _ in range(NUM_CORES_LAYER_1 * NUM_NEURON)] for __ in range(SUM_OF_PICS)]
-    spike_out_layer_2 = [[0 for _ in range(NUM_CORES_LAYER_2 * NUM_NEURON)] for __ in range(SUM_OF_PICS)]
+    spike_out_layer_0 = [[0 for _ in range(NUM_CORES_LAYER_0 * NUM_NEURON)] for __ in range(run_pics)]
+    spike_out_layer_1 = [[0 for _ in range(NUM_CORES_LAYER_1 * NUM_NEURON)] for __ in range(run_pics)]
+    spike_out_layer_2 = [[0 for _ in range(NUM_CORES_LAYER_2 * NUM_NEURON)] for __ in range(run_pics)]
     
     # --- Clock and Reset Initialization ---
     print("\nStarting Clock and Reset\n")
-    clock = Clock(dut.wb_clk_i, PERIOD, units="ns")
+    clock = Clock(dut.wb_clk_i, PERIOD, unit="ns")
     cocotb.start_soon(clock.start(start_high=True))
     
     # Initial state (assert reset)
@@ -392,7 +553,7 @@ async def neuron_network_test(dut):
     await RisingEdge(dut.wb_clk_i)
     
     # De-assert reset after a short delay
-    await Timer(PERIOD * 1, units="ns")
+    await Timer(PERIOD * 1, unit="ns")
     dut.wb_rst_i.value = 0
     
     # --- Layer 0 Simulation ---
@@ -406,11 +567,12 @@ async def neuron_network_test(dut):
 
         # 2. Simulation (EVERY PIC)
         # L0 input: stimuli (stimuli matrix, no core-specific indexing needed)
-        await run_layer_for_all_pics(dut, core_layer_0, layer, NUM_CORES_LAYER_0, None, spike_out_layer_0, stimuli=stimuli)
+        await run_layer_for_all_pics(dut, core_layer_0, layer, NUM_CORES_LAYER_0, None, spike_out_layer_0, run_pics, stimuli=stimuli)
 
     print("\n########################## FINISH LAYER 0 ########################")
     print(f"L0 output: {spike_out_layer_0}")
-    await Timer(PERIOD * 1, units="ns")
+    summarize_layer_activity("L0", spike_out_layer_0)
+    await Timer(PERIOD * 1, unit="ns")
 
     # --- Layer 1 Simulation ---
     # The cores in Layer 1 are indexed 0 to NUM_CORES_LAYER_1 - 1, corresponding to connection files 13 to 16.
@@ -426,11 +588,12 @@ async def neuron_network_test(dut):
         
         # 2. Simulation (EVERY PIC)
         # L1 input: spike_out_layer_0
-        await run_layer_for_all_pics(dut, core_layer_1, layer, NUM_CORES_LAYER_1, spike_out_layer_0, spike_out_layer_1, layer_axon_limit=NUM_AXON_LAYER_1)
+        await run_layer_for_all_pics(dut, core_layer_1, layer, NUM_CORES_LAYER_1, spike_out_layer_0, spike_out_layer_1, run_pics, layer_axon_limit=NUM_AXON_LAYER_1)
 
     print("\n########################## FINISH LAYER 1 ########################")
     print(f"L1 output: {spike_out_layer_1}")
-    await Timer(PERIOD * 1, units="ns")
+    summarize_layer_activity("L1", spike_out_layer_1)
+    await Timer(PERIOD * 1, unit="ns")
 
     # --- Layer 2 Simulation ---
     # The cores in Layer 2 are indexed 0 to NUM_CORES_LAYER_2 - 1, corresponding to connection files 26_part1 to 26_part4.
@@ -447,15 +610,19 @@ async def neuron_network_test(dut):
         # 2. Simulation (EVERY PIC)
         # L2 input: spike_out_layer_1. Note: core_idx is not used for L2 input indexing in run_layer_for_all_pics
         # because the original code suggests the L1 output is consolidated and indexed linearly for L2 input.
-        await run_layer_for_all_pics(dut, core_layer_2, layer, NUM_CORES_LAYER_2, spike_out_layer_1, spike_out_layer_2, layer_axon_limit=NUM_AXON_LAYER_2)
+        await run_layer_for_all_pics(dut, core_layer_2, layer, NUM_CORES_LAYER_2, spike_out_layer_1, spike_out_layer_2, run_pics, layer_axon_limit=NUM_AXON_LAYER_2)
 
     print("\n########################## FINISH LAYER 2 ########################")
     print(f"L2 output: {spike_out_layer_2}")
-    await Timer(PERIOD * 1, units="ns")
+    summarize_layer_activity("L2", spike_out_layer_2)
+    await Timer(PERIOD * 1, unit="ns")
 
     # --- Final Results Calculation ---
     correct_pic = 0
     predict_class = calculate_majority_class(spike_out_layer_2)
-    print(f"\nPrediction: Gesture Class {predict_class}")
+    if predict_class and predict_class[0] >= 0:
+        print(f"\nPrediction: Gesture Class {predict_class[0]}")
+    else:
+        print("\nPrediction: UNKNOWN (low confidence or saturation detected)")
         
     print("\nTest Completed.")
