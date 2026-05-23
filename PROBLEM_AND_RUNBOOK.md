@@ -1,8 +1,8 @@
 # Problem and Runbook (EDABK_SNN_CIM)
 
-## Problems faced so far (with current status)
+## Current Problem
 
-1. Tier2 cocotb zero-spike failure when using a negative read stimulus word.
+ Tier2 cocotb zero-spike failure when using a negative read stimulus word.
 	- What happened: The test drove 0xFFFF into `wbs_dat_i[15:0]`, which is signed -1 in the TB core. The LIF accumulator integrated downward, keeping V_mem below the threshold and producing zero spikes in both polarities.
 	- Why it matters: The test incorrectly appeared to prove a mapping bug, when the stimulus itself was suppressing spiking.
 	- Current: Not active when the stimulus word is a positive magnitude (e.g., 0x0010). If 0xFFFF is used again, the failure will reproduce.
