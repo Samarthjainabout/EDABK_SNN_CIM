@@ -50,18 +50,21 @@ module nvm_neuron_core_256x64 (
   wire  [4:0] row;          // pointed row/col in X1 IP
   wire  [4:0] col;
   // wire  [7:0] axon;         // 0 to 255
-  wire        weight_type;  // 1 or -1
   wire signed [15:0] stimuli;
-
   wire [15:0] connection;
+
+  // Debug/bypass alias: effective per-spike contribution (from Wishbone)
+  wire signed [15:0] current_weight;
 
   assign row        = wbs_dat_i[29:25];
   assign col        = wbs_dat_i[24:20];
+
+  // Matrix output is a 16-bit connection mask (1-bit per macro).
   assign connection = slave_dat_o[0][15:0];
-  // assign axon       = (row[2:0] << 5) + col;  // xem comment ben duoi cung
-  // assign weight_type= axon[0];
-  assign weight_type= col[0];
-  assign stimuli    = weight_type ? -wbs_dat_i[15:0] : wbs_dat_i[15:0];
+
+  // Stimulus is provided by the bus; treat as signed amplitude.
+  assign current_weight = $signed(wbs_dat_i[15:0]);
+  assign stimuli = current_weight;
 
   nvm_core_decoder core_decoder_inst (
     .addr                   (wbs_adr_i),
@@ -115,8 +118,8 @@ module nvm_neuron_core_256x64 (
     .stimuli    (stimuli),
     .connection (connection),
     .picture_done(picture_done),
-    // NEW: Force enable whenever a read is directed at the matrix
-    .enable     (wbs_stb_i & synapse_matrix_select & ~wbs_we_i), 
+    // Fire integration when matrix read data is acknowledged/valid.
+    .enable     (slave_ack_o[0]), 
     .spike_o    (spike_o)
   );
 

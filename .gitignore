@@ -10,7 +10,8 @@
 /dependencies
 /mgmt_core_wrapper
 /logs
-
+# Ignore massive DVS datasets
+data/
 # Python/Cocotb Environment
 /venv
 .venv/
@@ -32,3 +33,22 @@ test/
 temp.v
 counter.v
 *_origin.*
+
+# Local learning notes (do not push)
+LEARNING_PATH.md
+
+# Cocotb/test generated artifacts
+verilog/tb/sim_build/
+verilog/tb/results.xml
+verilog/tb/waveform.vcd
+verilog/tb/stimuli_class2.txt
+verilog/tb/__pycache__/
+verilog/tb/*.save
+*.save
+verilog/tb/d*nvm_neuromorphicEDABK_SNN_CIMverilogtbhdlnvm_neuron_block.v
+
+# QuantizedSNN local artifacts
+QuantizedSNNs/.git/
+QuantizedSNNs/data/
+QuantizedSNNs/results/
+QuantizedSNNs/__pycache__/
